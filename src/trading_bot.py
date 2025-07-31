@@ -80,131 +80,139 @@ class TradingBot:
         ]
         
     async def on_ha_candle_received(self, ha_candle: Dict):
-        """Process new Heikin Ashi candle for strategy analysis"""
+        """🚨 CLEAN VERSION: Process new Heikin Ashi candle for strategy analysis"""
         try:
-            symbol = ha_candle.get('symbol', 'UNKNOWN') 
-        
-            # Log new HA candle with emoji for visibility
-            self.logger.info(f"🕯️ NEW HA CANDLE - {symbol}: O:{ha_candle['ha_open']:.2f} H:{ha_candle['ha_high']:.2f} L:{ha_candle['ha_low']:.2f} C:{ha_candle['ha_close']:.2f}")
-        
-            # Get HA candle history from the ha_candle object or websocket manager
-            ha_candles = ha_candle.get('candle_history', [])
-
-            if not ha_candles and self.websocket_manager:
-                ha_candles = self.websocket_manager.get_latest_ha_candles(symbol, 50)
-        
-                candle_count = len(ha_candles)
-        
-            if candle_count < 15:
-                self.logger.info(f" Progress: {symbol} has {candle_count}/15 candles | Need {15-candle_count} more candles ({15-candle_count} minutes)")
+            # 1. BASIC VALIDATION
+            symbol = ha_candle.get('symbol', 'UNKNOWN')
+            if not symbol or symbol == 'UNKNOWN':
+                self.logger.warning("Received HA candle with unknown symbol")
                 return
         
-            self.logger.info(f" ANALYZING - {symbol} has {candle_count} candles - Running strategy analysis...")
+            # 2. LOG THE NEW CANDLE
+            self.logger.info(f"NEW HA CANDLE - {symbol}: O:{ha_candle.get('ha_open', 0):.2f} H:{ha_candle.get('ha_high', 0):.2f} L:{ha_candle.get('ha_low', 0):.2f} C:{ha_candle.get('ha_close', 0):.2f}")
         
-            # Get HA candle history from websocket manager
-            ha_candles = []
-            if self.websocket_manager and hasattr(self.websocket_manager, 'latest_ha_candles'):
-                if symbol in self.websocket_manager.latest_ha_candles:
-                    ha_candles = self.websocket_manager.latest_ha_candles[symbol]
+            # 3. GET CANDLE HISTORY (simplified logic)
+            ha_candles = ha_candle.get('candle_history', [])
+        
+            # Fallback: get from websocket manager if not in candle
+            if not ha_candles and self.websocket_manager:
+                if hasattr(self.websocket_manager, 'persistent_ha_candles'):
+                    ha_candles = self.websocket_manager.persistent_ha_candles.get(symbol, [])
+                elif hasattr(self.websocket_manager, 'latest_ha_candles'):
+                    ha_candles = self.websocket_manager.latest_ha_candles.get(symbol, [])
         
             candle_count = len(ha_candles)
         
+            # 4. CHECK IF WE HAVE ENOUGH CANDLES
             if candle_count < 15:
-                self.logger.info(f"Progress: {symbol} has {candle_count}/15 candles | Need {15-candle_count} more candles ({15-candle_count} minutes)")
+                self.logger.info(f"Progress: {symbol} has {candle_count}/15 candles | Need {15-candle_count} more")
                 return
         
-            self.logger.info(f"ANALYZING - {symbol} has {candle_count} candles - Running strategy analysis...")
+            # 5. 🚀 WE HAVE ENOUGH CANDLES - EXECUTE STRATEGIES!
+            self.logger.info(f"STRATEGY READY - {symbol} has {candle_count} candles - EXECUTING ANALYSIS...")
         
-            # Prepare market data for strategy
+            # 6. CALL THE SEPARATE STRATEGY EXECUTION METHOD
+            await self._execute_strategies_on_ha_candle(symbol, ha_candle, ha_candles)
+        
+        except Exception as e:
+            self.logger.error(f"Error processing HA candle: {e}")
+            import traceback
+            self.logger.error(f"Traceback: {traceback.format_exc()}")
+        
+    async def _execute_strategies_on_ha_candle(self, symbol: str, ha_candle: Dict, ha_candles: List[Dict]):
+        """🚨 SEPARATED: Execute all strategies when HA candle is received"""  
+        try:
+            self.logger.info(f"EXECUTING STRATEGIES for {symbol}")
+        
+            # Prepare comprehensive market data
             market_data = {
                 'symbol': symbol,
                 'ha_candle': ha_candle,
                 'ha_candles_history': ha_candles,
-                'instrument_key': f'NSE_INDEX|Nifty 50',
-                'current_price': ha_candle['ha_close']
+                'instrument_key': 'NSE_INDEX|Nifty 50',
+                'current_price': ha_candle.get('ha_close', 0),
+                'timestamp': datetime.now(),
+                # Add compatibility fields
+                'price': ha_candle.get('ha_close', 0),
+                'high': ha_candle.get('ha_high', 0),
+                'low': ha_candle.get('ha_low', 0),
+                'volume': ha_candle.get('volume', 0),
+                'open': ha_candle.get('ha_open', 0),
+                'close': ha_candle.get('ha_close', 0)
             }
         
+            self.logger.info(f" Market Data: Price={market_data['current_price']:.2f}, Candles={len(ha_candles)}")
+        
             # Process each strategy
-            for strategy in self.strategies:
+            strategy_count = len(self.strategies)
+            self.logger.info(f" Processing {strategy_count} strategies...")
+        
+            for i, strategy in enumerate(self.strategies):
                 if not strategy.is_active:
+                    self.logger.warning(f" Strategy {i+1}/{strategy_count} ({strategy.name}) is INACTIVE")
                     continue
-            
-            try:
-                # Import PineScriptStrategy to check type
-                from src.strategy.pine_script_strategy import PineScriptStrategy
                 
-                # Log strategy analysis details for Pine Script
-                if isinstance(strategy, PineScriptStrategy):
-                    # Update strategy's candle history
-                    strategy.ha_candles_history = ha_candles
+                try:
+                    self.logger.info(f" Analyzing strategy {i+1}/{strategy_count}: {strategy.name}")
+                
+                    # 🚨 ENTRY SIGNAL CHECK 🚨
+                    entry_order = await strategy.should_enter(market_data)
+                    if entry_order:
+                        option_type = getattr(entry_order, 'option_type', 'CE')
+                        self.logger.info(f" *** ENTRY SIGNAL *** {option_type} from {strategy.name}")
+                        self.logger.info(f"    Price: Rs.{entry_order.price:.2f} | Quantity: {entry_order.quantity}")
                     
-                    # Calculate indicators for logging
-                    trend_line = strategy.calculate_trend_line(ha_candles)
-                    adx, plus_di, minus_di = strategy.calculate_adx(ha_candles)
-                    strong_green, strong_red, body_pct = strategy.analyze_candle_strength(ha_candle)
-                    
-                    if trend_line and adx:
-                        current_price = ha_candle['ha_close']
-                        price_above = current_price > trend_line
-                        adx_strong = adx > strategy.adx_threshold
-                        
-                        # Detailed signal analysis
-                        self.logger.info(f" SIGNAL ANALYSIS:")
-                        self.logger.info(f"    Price: Rs.{current_price:.2f} | Trend: Rs.{trend_line:.2f} ({'+' if price_above else '-'}{abs(current_price-trend_line):.2f})")
-                        self.logger.info(f"    Candle: {' Strong Green' if strong_green else ' Strong Red' if strong_red else '⚪ Weak'} (Body: {body_pct:.1%})")
-                        self.logger.info(f"    ADX: {adx:.1f} {' Strong' if adx_strong else ' Weak'} (Need > {strategy.adx_threshold})")
-                        self.logger.info(f"    Position: {' In Trade' if strategy.in_trade else ' No Position'}")
-                        
-                        # Check all conditions
-                        buy_conditions_met = price_above and strong_green and adx_strong and not strategy.in_trade
-                        
-                        if buy_conditions_met:
-                            self.logger.info(f"*** BUY SIGNAL DETECTED! ***")
-                            self.logger.info(f"    All conditions met! Executing trade...")
+                        # Place order
+                        if await self.place_order(entry_order):
+                            self.orders.append(entry_order)
+                            await strategy.on_order_filled(entry_order)
+                            await self.send_trade_notification(entry_order, "ENTRY")
+                            self.logger.info(f"Entry order executed successfully")
                         else:
-                            missing = []
-                            if not price_above: missing.append("Price below trend")
-                            if not strong_green: missing.append("No strong green candle")
-                            if not adx_strong: missing.append(f"ADX too low ({adx:.1f})")
-                            if strategy.in_trade: missing.append("Already in position")
-                            
-                            self.logger.info(f"    Waiting for: {', '.join(missing)}")
+                            self.logger.error(f"Failed to place entry order")
+                    else:
+                        self.logger.info(f"No entry signal from {strategy.name}")
                 
-                # Check for entry signals
-                entry_order = await strategy.should_enter(market_data)
-                if entry_order:
-                    self.logger.info(f" *** TRADE SIGNAL *** {entry_order.option_type} ENTRY DETECTED!")
+                    # 🚨 EXIT SIGNAL CHECK 🚨
+                    positions_for_symbol = [pos for pos in self.positions.values() if pos.symbol == symbol]
+                
+                    if positions_for_symbol:
+                        self.logger.info(f"Checking {len(positions_for_symbol)} positions for exit...")
                     
-                    if await self.place_order(entry_order):
-                        self.orders.append(entry_order)
-                        await strategy.on_order_filled(entry_order)
-                        
-                        # Send trade notification
-                        await self.send_trade_notification(entry_order, "ENTRY")
-                
-                # Check for exit signals on existing positions
-                for position_key, position in list(self.positions.items()):
-                    if position.symbol == symbol:
-                        exit_order = await strategy.should_exit(position, market_data)
-                        if exit_order:
-                            self.logger.info(f" *** EXIT SIGNAL *** {exit_order.option_type} EXIT DETECTED!")
+                        for j, position in enumerate(positions_for_symbol):
+                            exit_order = await strategy.should_exit(position, market_data)
+                            if exit_order:
+                                option_type = getattr(exit_order, 'option_type', 'CE')
+                                self.logger.info(f"*** EXIT SIGNAL *** {option_type} from {strategy.name}")
                             
-                            if await self.place_order(exit_order):
-                                self.orders.append(exit_order)
-                                await strategy.on_order_filled(exit_order)
+                                if await self.place_order(exit_order):
+                                    self.orders.append(exit_order)
+                                    await strategy.on_order_filled(exit_order)
+                                    await self.send_trade_notification(exit_order, "EXIT")
                                 
-                                # Calculate P&L and send notification
-                                await self.send_trade_notification(exit_order, "EXIT")
-                                
-                                # Remove closed position
-                                if exit_order.quantity >= position.quantity:
-                                    del self.positions[position_key]
+                                    # Remove position if fully closed
+                                    position_key = f"{position.symbol}_{position.instrument_key}"
+                                    if position_key in self.positions:
+                                        if exit_order.quantity >= position.quantity:
+                                            del self.positions[position_key]
+                                            self.logger.info(f"Position fully closed: {position_key}")
+                            else:
+                                self.logger.info(f"No exit signal for position {j+1}")
+                    else:
+                        self.logger.debug(f"No positions to check for {symbol}")
                 
-            except Exception as e:
-                self.logger.error(f"Error processing strategy {strategy.name}: {e}")
+                except Exception as strategy_error:
+                    self.logger.error(f"Error in strategy {strategy.name}: {strategy_error}")
+                    import traceback
+                    self.logger.error(f"Strategy error details: {traceback.format_exc()}")
+        
+            self.logger.info(f"Strategy execution completed for {symbol}")
                 
         except Exception as e:
-            self.logger.error(f"Error processing HA candle: {e}")
+            self.logger.error(f"Critical error executing strategies: {e}")
+            import traceback
+            self.logger.error(f"Critical error details: {traceback.format_exc()}")
+    
         
             
     def add_strategy(self, strategy: BaseStrategy):
@@ -235,11 +243,11 @@ class TradingBot:
             
             # Set up callbacks with enhanced error handling
             self.websocket_manager.set_callbacks(
-                on_tick=self.on_tick_received,
-                on_candle=self.on_candle_completed,
-                on_ha_candle=self.on_ha_candle_completed,
-                on_order_update=self.on_order_update_received,
-                on_error=self.on_websocket_error
+            on_tick=None,  # Disabled to reduce noise
+            on_candle=None,  # Disabled to reduce noise
+            on_ha_candle=self.on_ha_candle_received,  # ← CRITICAL FIX
+            on_order_update=self.on_order_update_received,
+            on_error=self.on_websocket_error
             )
             
             # Subscribe to default instruments
@@ -559,10 +567,10 @@ class TradingBot:
                 missing_conditions = [cond for cond, status in buy_conditions if not status]
                 
                 if len(met_conditions) == len(buy_conditions):
-                    self.logger.info(f"🚀 BUY SIGNAL CONDITIONS MET! Ready for next candle confirmation.")
+                    self.logger.info(f"BUY SIGNAL CONDITIONS MET! Ready for next candle confirmation.")
                 else:
-                    self.logger.info(f"⏳ Waiting for: {', '.join(missing_conditions)}")
-                    self.logger.info(f"✅ Met: {', '.join(met_conditions)}")
+                    self.logger.info(f"Waiting for: {', '.join(missing_conditions)}")
+                    self.logger.info(f"Met: {', '.join(met_conditions)}")
                 
         except Exception as e:
             self.logger.error(f"Error analyzing signal conditions: {e}")
@@ -1144,10 +1152,10 @@ class MultiStrategyTradingBot(TradingBot):  # Extend your existing TradingBot
                 strategy = EnhancedPineScriptStrategy(strategy_name, config)
                 self.add_strategy(strategy)
                 
-                self.logger.info(f"✅ Initialized strategy: {strategy_name} ({config['trading_mode']})")
+                self.logger.info(f"Initialized strategy: {strategy_name} ({config['trading_mode']})")
                 
             except Exception as e:
-                self.logger.error(f"❌ Failed to initialize strategy {strategy_name}: {e}")
+                self.logger.error(f"Failed to initialize strategy {strategy_name}: {e}")
     
     async def evaluate_strategies_on_new_candle(self, symbol: str, ha_candle: Dict):
         """Enhanced strategy evaluation for multiple strategies"""

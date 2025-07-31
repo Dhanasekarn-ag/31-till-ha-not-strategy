@@ -1,13 +1,16 @@
 # ==================== src/websocket/websocket_manager.py (COMPLETE FIXED VERSION) ====================
 import logging
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import Dict, List, Optional, Callable, Optional
 import pandas as pd
 import numpy as np
 from collections import defaultdict, deque
 import json
 import threading
+import pytz
+
+
 
 try:
     import upstox_client
@@ -15,11 +18,51 @@ try:
     UPSTOX_SDK_AVAILABLE = True
 except ImportError:
     UPSTOX_SDK_AVAILABLE = False
+    
+
+class MarketHoursChecker:
+    """Check if Indian stock market is open"""
+    
+    def __init__(self):
+        self.ist_timezone = pytz.timezone('Asia/Kolkata')
+        self.market_open_time = time(9, 15)  # 9:15 AM
+        self.market_close_time = time(15, 30)  # 3:30 PM
+    
+    def is_market_open(self):
+        """Check if market is currently open"""
+        current_time = datetime.now(self.ist_timezone)
+        current_time_only = current_time.time()
+        current_day = current_time.weekday()
+        
+        # Check if it's a weekday (Monday=0, Sunday=6)
+        if current_day >= 5:  # Saturday or Sunday
+            return False
+        
+        # Check if within trading hours
+        return self.market_open_time <= current_time_only <= self.market_close_time
+    
+    def get_market_status(self):
+        """Get detailed market status"""
+        current_time = datetime.now(self.ist_timezone)
+        
+        if self.is_market_open():
+            return {
+                'status': 'OPEN',
+                'message': 'Market is open for trading',
+                'current_time': current_time.strftime('%H:%M:%S')
+            }
+        else:
+            return {
+                'status': 'CLOSED', 
+                'message': 'Market is closed',
+                'current_time': current_time.strftime('%H:%M:%S'),
+                'next_open': 'Tomorrow at 9:15 AM IST'
+            }
 
 class CandleAggregator:
     """Aggregates tick data into candles of different timeframes"""
     
-    def __init__(self, timeframe_minutes: int = 3):
+    def __init__(self, timeframe_minutes: int = 1):
         self.timeframe_minutes = timeframe_minutes
         self.timeframe_seconds = timeframe_minutes * 60
         self.current_candles: Dict[str, Dict] = {}
@@ -176,6 +219,9 @@ class WebSocketManager:
         self.api_key = api_key
         self.access_token = access_token
         self.logger = logging.getLogger(__name__)
+        self.market_checker = MarketHoursChecker()
+        self.last_market_status_check = datetime.now()
+        
         
         # Check if Upstox SDK is available
         if not UPSTOX_SDK_AVAILABLE:
@@ -343,14 +389,43 @@ class WebSocketManager:
         self.logger.info("Market data websocket connected")
     
     def _on_market_message(self, message):
-        """Process incoming market data with persistent storage"""
+        """Process incoming market data with MARKET HOURS CHECK"""
         try:
+            # 🚨 CRITICAL FIX: CHECK MARKET HOURS FIRST 🚨
+            current_time = datetime.now()
+            
+            # Check market status every 60 seconds to avoid spam
+            if (current_time - self.last_market_status_check).total_seconds() > 60:
+                market_status = self.market_checker.get_market_status()
+                
+                if market_status['status'] == 'CLOSED':
+                    self.logger.info(f"MARKET CLOSED at {market_status['current_time']} - Ignoring all data feeds")
+                    self.logger.info(f"Market will open at 9:15 AM IST tomorrow")
+                    return  # EXIT EARLY - DON'T PROCESS ANY DATA
+                else:
+                    self.logger.debug(f"Market OPEN at {market_status['current_time']} - Processing data")
+                
+                self.last_market_status_check = current_time
+            
+            # Only proceed with data processing if market is open
+            if not self.market_checker.is_market_open():
+                return  # EXIT EARLY
+            
+            # Continue with existing message processing
             self.last_data_received = datetime.now()
-        
+            
             # Parse market data message  
             if isinstance(message, dict):
                 feeds = message.get('feeds', {})
-            
+            elif isinstance(message, str):
+                try:
+                    message = json.loads(message)
+                    feeds = message.get('feeds', {})
+                except json.JSONDecodeError:
+                    return
+            else:
+                return
+                
             if feeds:
                 for instrument_key, data in feeds.items():
                     # Extract LTPC data from nested structure
@@ -387,28 +462,7 @@ class WebSocketManager:
                         # Store latest tick for monitoring
                         self.latest_ticks[symbol] = tick_data
                         
-                        # SHOW CANDLE PROGRESS
-                        if symbol == 'NIFTY':  # Show progress for NIFTY
-                            current_candle = self.candle_aggregator.get_current_candle(symbol)
-                            if current_candle:
-                                # Calculate progress
-                                elapsed = (datetime.now() - current_candle['start_time']).total_seconds()
-                                total_seconds = 60  # 1 minute = 60 seconds
-                                progress = (elapsed / total_seconds) * 100
-                                
-                                # Log candle building progress every 10 ticks
-                                if current_candle['tick_count'] % 10 == 0:
-                                    self.logger.info(
-                                        f"CANDLE PROGRESS - {symbol}: "
-                                        f"[{progress:.0f}%] "
-                                        f"O:{current_candle['open']:.2f} "
-                                        f"H:{current_candle['high']:.2f} "
-                                        f"L:{current_candle['low']:.2f} "
-                                        f"C:{current_candle['close']:.2f} "
-                                        f"({current_candle['tick_count']} ticks)"
-                                    )
-                        
-                        # PROCESS CANDLE AGGREGATION
+                        # PROCESS CANDLE AGGREGATION (only during market hours)
                         completed_candle = self.candle_aggregator.process_tick(symbol, tick_data)
                         
                         if completed_candle:
@@ -443,43 +497,30 @@ class WebSocketManager:
                             # Also update latest_ha_candles for compatibility
                             self.latest_ha_candles[symbol] = self.persistent_ha_candles[symbol].copy()
                             
-                            # SHOW CANDLE COUNT PROGRESS USING PERSISTENT STORAGE
+                            # SHOW CANDLE COUNT PROGRESS
                             candle_count = len(self.persistent_ha_candles[symbol])
                             if candle_count < 15:
                                 self.logger.info(f"Building data for {symbol}: {candle_count}/15 HA candles collected")
                             elif candle_count == 15:
                                 self.logger.info(f"READY! {symbol} has enough data (15 candles) - Strategy can now analyze!")
                             
-                            # NOTIFY STRATEGY OF NEW HA CANDLE
-                            if self.on_ha_candle_callback and symbol == 'NIFTY':
-                                # Pass the full history in the ha_candle object
+                            # TRIGGER STRATEGY EXECUTION (this will be fixed in Step 4)
+                            if self.on_ha_candle_callback and candle_count >= 15:
+                                # Add candle history to the HA candle
                                 ha_candle['candle_history'] = self.persistent_ha_candles[symbol].copy()
+                                ha_candle['symbol'] = symbol
                                 
-                                # Schedule callback safely
+                                # Schedule callback (will be improved in Step 4)
                                 try:
-                                    import threading
-                                    main_thread = threading.main_thread()
-                                    if hasattr(main_thread, '_loop'):
-                                        main_thread._loop.call_soon_threadsafe(
-                                            lambda: self._safe_async_call(self.on_ha_candle_callback, ha_candle)
-                                        )
-                                except Exception as e:
-                                    self.logger.debug(f"Could not schedule HA candle callback: {e}")
-                        
-                        # Show live price updates less frequently (every 5 seconds)
-                        if symbol == 'NIFTY':
-                            if not hasattr(self, '_last_price_log_time'):
-                                self._last_price_log_time = {}
-                            
-                            now = datetime.now()
-                            if symbol not in self._last_price_log_time or \
-                               (now - self._last_price_log_time[symbol]).total_seconds() >= 5:
-                                self.logger.info(f"LIVE - {symbol}: Rs.{current_price:.2f}")
-                                self._last_price_log_time[symbol] = now
-        
+                                    import asyncio
+                                    loop = asyncio.get_running_loop()
+                                    loop.create_task(self.on_ha_candle_callback(ha_candle))
+                                    self.logger.info(f"STRATEGY CALLBACK SCHEDULED for {symbol}")
+                                except Exception as callback_error:
+                                    self.logger.warning(f"Strategy callback scheduling issue: {callback_error}")
+            
         except Exception as e:
             self.logger.error(f"Error processing market message: {e}")
-                            
                             
 
     def _safe_async_call(self, callback, data):

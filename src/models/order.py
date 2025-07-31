@@ -5,34 +5,38 @@ from datetime import datetime
 from enum import Enum
 
 class OrderStatus(Enum):
-    PENDING = "pending"
-    PLACED = "placed"
-    FILLED = "filled"
-    CANCELLED = "cancelled"
-    REJECTED = "rejected"
-
+    PENDING = "PENDING"
+    FILLED = "FILLED"
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+    
 class OrderType(Enum):
     MARKET = "MARKET"
     LIMIT = "LIMIT"
-
+    STOP_LOSS = "STOP_LOSS"
+    
 class TransactionType(Enum):
     BUY = "BUY"
     SELL = "SELL"
-
+    
 @dataclass
 class Order:
-    """Order model"""
     symbol: str
     quantity: int
     price: float
     order_type: OrderType
     transaction_type: TransactionType
+    instrument_key: str = ""
     status: OrderStatus = OrderStatus.PENDING
     order_id: Optional[str] = None
-    instrument_key: Optional[str] = None
-    timestamp: datetime = None
     filled_price: Optional[float] = None
     filled_quantity: Optional[int] = None
+    timestamp: Optional[datetime] = None
+    
+    # Strategy-specific attributes for CE/PE support
+    option_type: Optional[str] = None  # 'CE' or 'PE'
+    strategy_name: Optional[str] = None
+    strategy_mode: Optional[str] = None
     
     def __post_init__(self):
         if self.timestamp is None:
