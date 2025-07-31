@@ -7,6 +7,9 @@ import os
 import sys
 import asyncio
 from pathlib import Path
+import logging
+import sys
+
 
 # Add src to path
 sys.path.append(str(Path(__file__).parent / "src"))
@@ -36,5 +39,11 @@ def main():
         print(f"Error starting bot: {e}")
         raise
 
+if sys.platform == "win32":
+    import codecs
+    sys.stdout = codecs.getwriter('utf-8')(sys.stdout.buffer, 'strict')
+    sys.stderr = codecs.getwriter('utf-8')(sys.stderr.buffer, 'strict')
+    
+    
 if __name__ == "__main__":
     main()

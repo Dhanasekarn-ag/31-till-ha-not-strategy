@@ -1,4 +1,4 @@
-# ==================== src/websocket/websocket_manager.py (YESTERDAY NIGHT WORKING VERSION) ====================
+# ==================== src/websocket/websocket_manager.py (COMPLETE FIXED VERSION) ====================
 import logging
 import asyncio
 from datetime import datetime, timedelta
@@ -170,7 +170,7 @@ class HeikinAshiConverter:
         return []
 
 class WebSocketManager:
-    """Enhanced WebSocket Manager with improved error handling and monitoring"""
+    """Enhanced WebSocket Manager with persistent candle storage"""
     
     def __init__(self, api_key: str, access_token: str):
         self.api_key = api_key
@@ -182,7 +182,7 @@ class WebSocketManager:
             raise ImportError("upstox-python-sdk is required for websocket functionality. Install with: pip install upstox-python-sdk")
         
         # Initialize components
-        self.candle_aggregator = CandleAggregator(timeframe_minutes=3)
+        self.candle_aggregator = CandleAggregator(timeframe_minutes=1)
         self.ha_converter = HeikinAshiConverter()
         
         # WebSocket connections
@@ -199,20 +199,25 @@ class WebSocketManager:
         # Subscribed instruments
         self.subscribed_instruments: List[str] = []
         
-        # Connection status
-        self.is_connected = False
-        self.connection_thread = None
-
-         # Connection state
+        # Connection state
         self.is_connected = False
         self.last_data_received = datetime.now()
         self.connection_attempts = 0
         self.max_reconnection_attempts = 5
         
+        # Keep existing storage for backward compatibility
+        self.latest_candles: Dict[str, List[Dict]] = {}
+        self.latest_ha_candles: Dict[str, List[Dict]] = {}
+        
+         # PERSISTENT CANDLE STORAGE - MOVED HERE TO PREVENT RESET
+        self.persistent_candles: Dict[str, List[Dict]] = {}
+        self.persistent_ha_candles: Dict[str, List[Dict]] = {}
+        self.latest_ticks: Dict[str, Dict] = {}
+        
         # Data storage
         self.latest_candles: Dict[str, List[Dict]] = {}
         self.latest_ha_candles: Dict[str, List[Dict]] = {}
-
+        self.latest_ticks: Dict[str, Dict] = {}  # Store latest ticks for monitoring
         
     def set_callbacks(self, on_tick=None, on_candle=None, on_ha_candle=None, 
                      on_order_update=None, on_error=None):
@@ -338,53 +343,183 @@ class WebSocketManager:
         self.logger.info("Market data websocket connected")
     
     def _on_market_message(self, message):
-        """Process incoming market data"""
+        """Process incoming market data with persistent storage"""
         try:
-            # Parse market data message
+            self.last_data_received = datetime.now()
+        
+            # Parse market data message  
             if isinstance(message, dict):
                 feeds = message.get('feeds', {})
-                
+            
+            if feeds:
                 for instrument_key, data in feeds.items():
-                    ltpc = data.get('ltpc', {})
-                    if ltpc:
-                        # Extract tick data
+                    # Extract LTPC data from nested structure
+                    ltpc_data = None
+                    
+                    # Method 1: Try direct ltpc access (for regular ticks)
+                    if 'ltpc' in data:
+                        ltpc_data = data['ltpc']
+                    
+                    # Method 2: Try nested structure (for full feed)
+                    elif 'fullFeed' in data:
+                        full_feed = data['fullFeed']
+                        if 'indexFF' in full_feed and 'ltpc' in full_feed['indexFF']:
+                            ltpc_data = full_feed['indexFF']['ltpc']
+                    
+                    # Process the LTPC data correctly
+                    if ltpc_data and 'ltp' in ltpc_data:
+                        # Extract price data
+                        current_price = float(ltpc_data.get('ltp', 0))
+                        volume = ltpc_data.get('vol', 0)
+                        
+                        # Get symbol name
+                        symbol = self._get_symbol_from_key(instrument_key)
+                        
+                        # Create tick data
                         tick_data = {
                             'instrument_key': instrument_key,
-                            'ltp': ltpc.get('ltp'),
-                            'volume': ltpc.get('vol', 0),
-                            'timestamp': datetime.now()
+                            'ltp': current_price,
+                            'volume': volume,
+                            'timestamp': datetime.now(),
+                            'symbol': symbol
                         }
                         
-                        # Call tick callback
-                        if self.on_tick_callback:
-                            asyncio.create_task(self.on_tick_callback(tick_data))
+                        # Store latest tick for monitoring
+                        self.latest_ticks[symbol] = tick_data
                         
-                        # Process candle aggregation
-                        symbol = self._get_symbol_from_key(instrument_key)
+                        # SHOW CANDLE PROGRESS
+                        if symbol == 'NIFTY':  # Show progress for NIFTY
+                            current_candle = self.candle_aggregator.get_current_candle(symbol)
+                            if current_candle:
+                                # Calculate progress
+                                elapsed = (datetime.now() - current_candle['start_time']).total_seconds()
+                                total_seconds = 60  # 1 minute = 60 seconds
+                                progress = (elapsed / total_seconds) * 100
+                                
+                                # Log candle building progress every 10 ticks
+                                if current_candle['tick_count'] % 10 == 0:
+                                    self.logger.info(
+                                        f"CANDLE PROGRESS - {symbol}: "
+                                        f"[{progress:.0f}%] "
+                                        f"O:{current_candle['open']:.2f} "
+                                        f"H:{current_candle['high']:.2f} "
+                                        f"L:{current_candle['low']:.2f} "
+                                        f"C:{current_candle['close']:.2f} "
+                                        f"({current_candle['tick_count']} ticks)"
+                                    )
+                        
+                        # PROCESS CANDLE AGGREGATION
                         completed_candle = self.candle_aggregator.process_tick(symbol, tick_data)
                         
                         if completed_candle:
-                            # Call candle callback
-                            if self.on_candle_callback:
-                                asyncio.create_task(self.on_candle_callback(completed_candle))
+                            self.logger.info(f"NEW CANDLE - {symbol}: O:{completed_candle['open']:.2f} H:{completed_candle['high']:.2f} L:{completed_candle['low']:.2f} C:{completed_candle['close']:.2f}")
                             
-                            # Convert to Heikin Ashi
+                            # Store in PERSISTENT storage
+                            if symbol not in self.persistent_candles:
+                                self.persistent_candles[symbol] = []
+                            self.persistent_candles[symbol].append(completed_candle)
+                            
+                            # Keep only last 100 candles
+                            if len(self.persistent_candles[symbol]) > 100:
+                                self.persistent_candles[symbol] = self.persistent_candles[symbol][-100:]
+                            
+                            # Also update latest_candles for compatibility
+                            self.latest_candles[symbol] = self.persistent_candles[symbol].copy()
+                            
+                            # CONVERT TO HEIKIN ASHI
                             ha_candle = self.ha_converter.convert_candle(symbol, completed_candle)
                             
-                            # Call HA candle callback
-                            if self.on_ha_candle_callback:
-                                asyncio.create_task(self.on_ha_candle_callback(ha_candle))
-            
+                            self.logger.info(f"HA CANDLE - {symbol}: O:{ha_candle['ha_open']:.2f} H:{ha_candle['ha_high']:.2f} L:{ha_candle['ha_low']:.2f} C:{ha_candle['ha_close']:.2f}")
+                            
+                            # Store in PERSISTENT HA storage
+                            if symbol not in self.persistent_ha_candles:
+                                self.persistent_ha_candles[symbol] = []
+                            self.persistent_ha_candles[symbol].append(ha_candle)
+                            
+                            # Keep only last 100 HA candles
+                            if len(self.persistent_ha_candles[symbol]) > 100:
+                                self.persistent_ha_candles[symbol] = self.persistent_ha_candles[symbol][-100:]
+                            
+                            # Also update latest_ha_candles for compatibility
+                            self.latest_ha_candles[symbol] = self.persistent_ha_candles[symbol].copy()
+                            
+                            # SHOW CANDLE COUNT PROGRESS USING PERSISTENT STORAGE
+                            candle_count = len(self.persistent_ha_candles[symbol])
+                            if candle_count < 15:
+                                self.logger.info(f"Building data for {symbol}: {candle_count}/15 HA candles collected")
+                            elif candle_count == 15:
+                                self.logger.info(f"READY! {symbol} has enough data (15 candles) - Strategy can now analyze!")
+                            
+                            # NOTIFY STRATEGY OF NEW HA CANDLE
+                            if self.on_ha_candle_callback and symbol == 'NIFTY':
+                                # Pass the full history in the ha_candle object
+                                ha_candle['candle_history'] = self.persistent_ha_candles[symbol].copy()
+                                
+                                # Schedule callback safely
+                                try:
+                                    import threading
+                                    main_thread = threading.main_thread()
+                                    if hasattr(main_thread, '_loop'):
+                                        main_thread._loop.call_soon_threadsafe(
+                                            lambda: self._safe_async_call(self.on_ha_candle_callback, ha_candle)
+                                        )
+                                except Exception as e:
+                                    self.logger.debug(f"Could not schedule HA candle callback: {e}")
+                        
+                        # Show live price updates less frequently (every 5 seconds)
+                        if symbol == 'NIFTY':
+                            if not hasattr(self, '_last_price_log_time'):
+                                self._last_price_log_time = {}
+                            
+                            now = datetime.now()
+                            if symbol not in self._last_price_log_time or \
+                               (now - self._last_price_log_time[symbol]).total_seconds() >= 5:
+                                self.logger.info(f"LIVE - {symbol}: Rs.{current_price:.2f}")
+                                self._last_price_log_time[symbol] = now
+        
         except Exception as e:
             self.logger.error(f"Error processing market message: {e}")
+                            
+                            
+
+    def _safe_async_call(self, callback, data):
+        """Safely call async function"""
+        try:
+            import asyncio
+            asyncio.create_task(callback(data))
+        except Exception as e:
+            self.logger.debug(f"Error in async callback: {e}")
+        
+    def is_ready_for_trading(self) -> bool:
+        """Check if WebSocket is ready for trading"""
+        try:
+            # Check if connected
+            if not self.is_connected:
+                return False
+            
+            # Check if we have recent data (within last 60 seconds)
+            if hasattr(self, 'last_data_received'):
+                data_age = (datetime.now() - self.last_data_received).total_seconds()
+                if data_age > 60:  # More than 1 minute old
+                    self.logger.warning(f"Data is {data_age:.0f} seconds old - not ready for trading")
+                    return False
+            else:
+                # No data received yet
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error checking trading readiness: {e}")
+            return False
     
     def _on_market_error(self, error):
         """Called when market websocket encounters an error"""
         self.logger.error(f"Market websocket error: {error}")
     
-    def _on_market_close(self):
+    def _on_market_close(self, code=None, reason=None):
         """Called when market websocket connection closes"""
-        self.logger.warning("Market data websocket connection closed")
+        self.logger.warning(f"Market data websocket connection closed - Code: {code}, Reason: {reason}")
     
     # Portfolio Data Event Handlers
     def _on_portfolio_open(self):
@@ -404,25 +539,46 @@ class WebSocketManager:
         """Called when portfolio websocket encounters an error"""
         self.logger.error(f"Portfolio websocket error: {error}")
     
-    def _on_portfolio_close(self):
-        """Called when portfolio websocket connection closes"""
-        self.logger.warning("Portfolio data websocket connection closed")
+    def _on_portfolio_close(self, code=None, reason=None):
+        """Called when portfolio websocket connection closes"""  
+        self.logger.warning(f"Portfolio data websocket connection closed - Code: {code}, Reason: {reason}")
     
     def _get_symbol_from_key(self, instrument_key: str) -> str:
-        """Extract symbol from instrument key"""
-        # Example: NSE_FO|50201 -> extract meaningful symbol
+        """Convert instrument key to symbol name - ENHANCED VERSION"""
+        # Enhanced mapping for your subscribed instruments
+        key_to_symbol = {
+            'NSE_INDEX|Nifty 50': 'NIFTY',
+            'NSE_INDEX|Nifty Bank': 'BANKNIFTY',
+            'BSE_INDEX|SENSEX': 'SENSEX',
+            'NSE_INDEX|SENSEX': 'SENSEX'  # Alternative mapping
+        }
+        
+        # Log for debugging during market hours
+        self.logger.debug(f"Mapping instrument key: {instrument_key}")
+        
+        # Return mapped symbol or fallback
+        mapped_symbol = key_to_symbol.get(instrument_key)
+        if mapped_symbol:
+            return mapped_symbol
+        
+        # Fallback logic
         parts = instrument_key.split('|')
         if len(parts) > 1:
-            return parts[1]
+            return parts[1].replace(' ', '_').upper()  # Convert "Nifty 50" to "NIFTY_50"
         return instrument_key
     
     def get_latest_candles(self, symbol: str, count: int = 50) -> List[Dict]:
-        """Get latest candles for a symbol"""
-        return self.candle_aggregator.get_latest_candles(symbol, count)
+        """Get latest candles from persistent storage"""
+        if symbol in self.persistent_candles:
+            return self.persistent_candles[symbol][-count:]
+        return []
+
     
     def get_latest_ha_candles(self, symbol: str, count: int = 50) -> List[Dict]:
-        """Get latest Heikin Ashi candles for a symbol"""
-        return self.ha_converter.get_latest_ha_candles(symbol, count)
+        """Get latest Heikin Ashi candles from persistent storage"""
+        if symbol in self.persistent_ha_candles:
+            return self.persistent_ha_candles[symbol][-count:]
+        return []
     
     def get_connection_status(self) -> Dict:
         """Get current connection status"""
@@ -430,9 +586,36 @@ class WebSocketManager:
             'is_connected': self.is_connected,
             'last_data_received': self.last_data_received,
             'connection_attempts': self.connection_attempts,
-            'subscribed_instruments': getattr(self, 'subscribed_instruments', [])
+            'subscribed_instruments': getattr(self, 'subscribed_instruments', []),
+            'latest_ticks': self.latest_ticks
         }
     
     def get_current_candle(self, symbol: str) -> Optional[Dict]:
         """Get current incomplete candle for a symbol"""
         return self.candle_aggregator.get_current_candle(symbol)
+    
+    def get_current_ha_candles(self, symbol: str, count: int = 15) -> List[Dict]:
+        """Get latest HA candles for strategy analysis - uses persistent storage"""
+        if symbol in self.persistent_ha_candles:
+            return self.persistent_ha_candles[symbol][-count:]
+        return []
+    
+    def restore_candle_history(self, symbol: str, candles: List[Dict], ha_candles: List[Dict]):
+        """Restore candle history after reconnection"""
+        if candles:
+            self.persistent_candles[symbol] = candles
+            self.latest_candles[symbol] = candles.copy()
+            
+        if ha_candles:
+            self.persistent_ha_candles[symbol] = ha_candles
+            self.latest_ha_candles[symbol] = ha_candles.copy()
+            
+        self.logger.info(f"Restored {len(ha_candles)} HA candles for {symbol}")
+
+    # Also update the HeikinAshiConverter to handle persistent storage
+    def _restore_ha_converter_state(self):
+        """Restore HA converter state after reconnection"""
+        for symbol, ha_candles in self.persistent_ha_candles.items():
+            if ha_candles and hasattr(self.ha_converter, 'ha_candles'):
+                # Restore the last few candles to maintain HA calculation continuity
+                self.ha_converter.ha_candles[symbol] = deque(ha_candles[-5:], maxlen=100)

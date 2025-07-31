@@ -3,6 +3,9 @@ import logging
 import logging.handlers
 from pathlib import Path
 from config.settings import get_settings
+import logging
+import sys
+
 
 def setup_logging():
     """Setup logging configuration"""
@@ -57,3 +60,33 @@ def setup_logging():
     trading_logger = logging.getLogger('trading')
     trading_logger.addHandler(trades_handler)
     trading_logger.setLevel(logging.INFO)
+    
+# Configure logging with UTF-8 encoding for emojis
+class UTF8StreamHandler(logging.StreamHandler):
+    def __init__(self, stream=None):
+        super().__init__(stream)
+        if hasattr(self.stream, 'reconfigure'):
+            self.stream.reconfigure(encoding='utf-8')
+
+# Replace console handler
+def setup_utf8_logging():
+    """Setup UTF-8 logging to handle emojis properly"""
+    
+    # Remove existing handlers
+    logger = logging.getLogger()
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # Add UTF-8 compatible handlers
+    file_handler = logging.FileHandler('logs/trading_bot.log', encoding='utf-8')
+    console_handler = UTF8StreamHandler(sys.stdout)
+    
+    # Set format
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Add to logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.setLevel(logging.INFO)

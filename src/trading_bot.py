@@ -79,6 +79,134 @@ class TradingBot:
             'BSE_INDEX|SENSEX'
         ]
         
+    async def on_ha_candle_received(self, ha_candle: Dict):
+        """Process new Heikin Ashi candle for strategy analysis"""
+        try:
+            symbol = ha_candle.get('symbol', 'UNKNOWN') 
+        
+            # Log new HA candle with emoji for visibility
+            self.logger.info(f"🕯️ NEW HA CANDLE - {symbol}: O:{ha_candle['ha_open']:.2f} H:{ha_candle['ha_high']:.2f} L:{ha_candle['ha_low']:.2f} C:{ha_candle['ha_close']:.2f}")
+        
+            # Get HA candle history from the ha_candle object or websocket manager
+            ha_candles = ha_candle.get('candle_history', [])
+
+            if not ha_candles and self.websocket_manager:
+                ha_candles = self.websocket_manager.get_latest_ha_candles(symbol, 50)
+        
+                candle_count = len(ha_candles)
+        
+            if candle_count < 15:
+                self.logger.info(f" Progress: {symbol} has {candle_count}/15 candles | Need {15-candle_count} more candles ({15-candle_count} minutes)")
+                return
+        
+            self.logger.info(f" ANALYZING - {symbol} has {candle_count} candles - Running strategy analysis...")
+        
+            # Get HA candle history from websocket manager
+            ha_candles = []
+            if self.websocket_manager and hasattr(self.websocket_manager, 'latest_ha_candles'):
+                if symbol in self.websocket_manager.latest_ha_candles:
+                    ha_candles = self.websocket_manager.latest_ha_candles[symbol]
+        
+            candle_count = len(ha_candles)
+        
+            if candle_count < 15:
+                self.logger.info(f"Progress: {symbol} has {candle_count}/15 candles | Need {15-candle_count} more candles ({15-candle_count} minutes)")
+                return
+        
+            self.logger.info(f"ANALYZING - {symbol} has {candle_count} candles - Running strategy analysis...")
+        
+            # Prepare market data for strategy
+            market_data = {
+                'symbol': symbol,
+                'ha_candle': ha_candle,
+                'ha_candles_history': ha_candles,
+                'instrument_key': f'NSE_INDEX|Nifty 50',
+                'current_price': ha_candle['ha_close']
+            }
+        
+            # Process each strategy
+            for strategy in self.strategies:
+                if not strategy.is_active:
+                    continue
+            
+            try:
+                # Import PineScriptStrategy to check type
+                from src.strategy.pine_script_strategy import PineScriptStrategy
+                
+                # Log strategy analysis details for Pine Script
+                if isinstance(strategy, PineScriptStrategy):
+                    # Update strategy's candle history
+                    strategy.ha_candles_history = ha_candles
+                    
+                    # Calculate indicators for logging
+                    trend_line = strategy.calculate_trend_line(ha_candles)
+                    adx, plus_di, minus_di = strategy.calculate_adx(ha_candles)
+                    strong_green, strong_red, body_pct = strategy.analyze_candle_strength(ha_candle)
+                    
+                    if trend_line and adx:
+                        current_price = ha_candle['ha_close']
+                        price_above = current_price > trend_line
+                        adx_strong = adx > strategy.adx_threshold
+                        
+                        # Detailed signal analysis
+                        self.logger.info(f" SIGNAL ANALYSIS:")
+                        self.logger.info(f"    Price: Rs.{current_price:.2f} | Trend: Rs.{trend_line:.2f} ({'+' if price_above else '-'}{abs(current_price-trend_line):.2f})")
+                        self.logger.info(f"    Candle: {' Strong Green' if strong_green else ' Strong Red' if strong_red else '⚪ Weak'} (Body: {body_pct:.1%})")
+                        self.logger.info(f"    ADX: {adx:.1f} {' Strong' if adx_strong else ' Weak'} (Need > {strategy.adx_threshold})")
+                        self.logger.info(f"    Position: {' In Trade' if strategy.in_trade else ' No Position'}")
+                        
+                        # Check all conditions
+                        buy_conditions_met = price_above and strong_green and adx_strong and not strategy.in_trade
+                        
+                        if buy_conditions_met:
+                            self.logger.info(f"*** BUY SIGNAL DETECTED! ***")
+                            self.logger.info(f"    All conditions met! Executing trade...")
+                        else:
+                            missing = []
+                            if not price_above: missing.append("Price below trend")
+                            if not strong_green: missing.append("No strong green candle")
+                            if not adx_strong: missing.append(f"ADX too low ({adx:.1f})")
+                            if strategy.in_trade: missing.append("Already in position")
+                            
+                            self.logger.info(f"    Waiting for: {', '.join(missing)}")
+                
+                # Check for entry signals
+                entry_order = await strategy.should_enter(market_data)
+                if entry_order:
+                    self.logger.info(f" *** TRADE SIGNAL *** {entry_order.option_type} ENTRY DETECTED!")
+                    
+                    if await self.place_order(entry_order):
+                        self.orders.append(entry_order)
+                        await strategy.on_order_filled(entry_order)
+                        
+                        # Send trade notification
+                        await self.send_trade_notification(entry_order, "ENTRY")
+                
+                # Check for exit signals on existing positions
+                for position_key, position in list(self.positions.items()):
+                    if position.symbol == symbol:
+                        exit_order = await strategy.should_exit(position, market_data)
+                        if exit_order:
+                            self.logger.info(f" *** EXIT SIGNAL *** {exit_order.option_type} EXIT DETECTED!")
+                            
+                            if await self.place_order(exit_order):
+                                self.orders.append(exit_order)
+                                await strategy.on_order_filled(exit_order)
+                                
+                                # Calculate P&L and send notification
+                                await self.send_trade_notification(exit_order, "EXIT")
+                                
+                                # Remove closed position
+                                if exit_order.quantity >= position.quantity:
+                                    del self.positions[position_key]
+                
+            except Exception as e:
+                self.logger.error(f"Error processing strategy {strategy.name}: {e}")
+                
+        except Exception as e:
+            self.logger.error(f"Error processing HA candle: {e}")
+        
+            
     def add_strategy(self, strategy: BaseStrategy):
         """Add a trading strategy"""
         self.strategies.append(strategy)
@@ -127,9 +255,21 @@ class TradingBot:
             
         except Exception as e:
             self.logger.error(f"Failed to setup websockets: {e}")
-            await self.notifier.send_error_alert(f"🚨 WebSocket setup failed: {str(e)}")
+            await self.notifier.send_error_alert(f" WebSocket setup failed: {str(e)}")
             return False
     
+    def setup_websocket_callbacks(self):
+        """Setup WebSocket event callbacks"""
+        self.websocket_manager.set_callbacks(
+            on_tick=None,  # Disable to reduce noise
+            on_candle=None,  # Disable to reduce noise
+            on_ha_candle=self.on_ha_candle_received,  # ← ENABLE THIS
+            on_order_update=self.on_order_update_received,
+            on_error=self.on_websocket_error
+        )
+        self.logger.info("WebSocket callbacks configured for HA candle processing")
+
+
     async def on_tick_received(self, tick_data: Dict):
         """Enhanced tick handler with timestamp and monitoring"""
         try:
@@ -192,31 +332,48 @@ class TradingBot:
             self.logger.error(f"Error processing order update: {e}")
     
     async def on_websocket_error(self, error_message: str):
-        """Enhanced WebSocket error handler with auto-reconnection"""
+        """Enhanced WebSocket error handler with history preservation"""
         try:
             self.logger.error(f"WebSocket Error: {error_message}")
-            
+        
+            # SAVE CANDLE HISTORY BEFORE ANY RECONNECTION
+            saved_candles = {}
+            saved_ha_candles = {}
+        
+            if self.websocket_manager:
+                for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                    saved_candles[symbol] = self.websocket_manager.get_latest_candles(symbol, 100)
+                    saved_ha_candles[symbol] = self.websocket_manager.get_latest_ha_candles(symbol, 100)
+        
             # Send immediate Telegram alert
             await self.notifier.send_error_alert(f"🚨 WebSocket Error: {error_message}")
-            
+        
             # Attempt automatic reconnection
             self.logger.info("Attempting automatic WebSocket reconnection...")
             self.websocket_reconnect_attempts += 1
-            
+        
             # Small delay before reconnection attempt
             await asyncio.sleep(5)
-            
+        
             reconnect_success = await self.setup_websockets()
+        
+            if reconnect_success and saved_ha_candles:
+                # Restore candle history
+                for symbol, candles in saved_candles.items():
+                    if candles and symbol in saved_ha_candles:
+                        self.websocket_manager.restore_candle_history(
+                            symbol, 
+                            candles, 
+                            saved_ha_candles[symbol]
+                        )
             
-            if reconnect_success:
                 await self.notifier.send_status_update("Auto-Reconnected", 
-                    f"WebSocket reconnected automatically (Attempt #{self.websocket_reconnect_attempts})")
+                    f"✅ WebSocket reconnected with history preserved!")
                 self.websocket_reconnect_attempts = 0
             else:
                 await self.notifier.send_error_alert(
-                    f"❌ Auto-reconnection failed (Attempt #{self.websocket_reconnect_attempts}). "
-                    f"Manual restart may be required.")
-                
+                    f"❌ Auto-reconnection failed. Manual restart may be required.")
+            
         except Exception as e:
             self.logger.error(f"Error handling WebSocket error: {e}")
     
@@ -224,85 +381,120 @@ class TradingBot:
         """Monitor WebSocket health and auto-reconnect if needed"""
         try:
             current_time = datetime.now()
-            
+        
             # Check every 5 minutes
             if (current_time - self.last_websocket_check).total_seconds() < 300:
                 return
-                
-            self.last_websocket_check = current_time
             
+            self.last_websocket_check = current_time
+        
             if not self.websocket_manager:
                 return
-            
+        
             # Check if we have recent data (within 2 minutes)
             data_age_limit = 120
             recent_data = False
-            
+        
             for symbol, tick_data in self.latest_ticks.items():
                 if 'timestamp' in tick_data:
                     data_age = (current_time - tick_data['timestamp']).total_seconds()
                     if data_age < data_age_limit:
                         recent_data = True
                         break
-            
+        
             # If no recent data during market hours, attempt reconnection
             if not recent_data and self.is_market_open():
                 self.logger.warning("No recent WebSocket data detected during market hours")
-                await self.notifier.send_error_alert("⚠️ WebSocket data stale. Attempting reconnection...")
+            
+                # SAVE CANDLE HISTORY BEFORE RECONNECTION
+                saved_candles = {}
+                saved_ha_candles = {}
+            
+            if self.websocket_manager:
+                for symbol in ['NIFTY', 'BANKNIFTY', 'SENSEX']:
+                    saved_candles[symbol] = self.websocket_manager.get_latest_candles(symbol, 100)
+                    saved_ha_candles[symbol] = self.websocket_manager.get_latest_ha_candles(symbol, 100)
+                    
+                    if saved_ha_candles[symbol]:
+                        self.logger.info(f"Saving {len(saved_ha_candles[symbol])} HA candles for {symbol}")
+            
+            # Stop existing connections
+            try:
+                self.websocket_manager.stop_all_streams()
+            except:
+                pass
+            
+            # Small delay before reconnection
+            await asyncio.sleep(2)
+            
+            # Attempt reconnection
+            self.websocket_reconnect_attempts += 1
+            reconnect_success = await self.setup_websockets()
+            
+            if reconnect_success and saved_ha_candles:
+                # RESTORE CANDLE HISTORY AFTER RECONNECTION
+                for symbol, candles in saved_candles.items():
+                    if candles and symbol in saved_ha_candles:
+                        self.websocket_manager.restore_candle_history(
+                            symbol, 
+                            candles, 
+                            saved_ha_candles[symbol]
+                        )
                 
-                # Stop existing connections
-                try:
-                    self.websocket_manager.stop_all_streams()
-                except:
-                    pass
-                
-                # Attempt reconnection
-                self.websocket_reconnect_attempts += 1
-                reconnect_success = await self.setup_websockets()
-                
-                if reconnect_success:
-                    await self.notifier.send_status_update("Health Check Reconnected", 
-                        f"WebSocket reconnected via health check (Attempt #{self.websocket_reconnect_attempts})")
-                else:
-                    await self.notifier.send_error_alert(
-                        f"❌ Health check reconnection failed (Attempt #{self.websocket_reconnect_attempts})")
-                
+                await self.notifier.send_status_update("WebSocket Reconnected", 
+                    f"✅ Reconnected with history preserved! Candles intact.")
+                self.logger.info("WebSocket reconnected with candle history preserved")
+            else:
+                await self.notifier.send_error_alert(
+                    f"❌ Health check reconnection failed (Attempt #{self.websocket_reconnect_attempts})")
+            
         except Exception as e:
             self.logger.error(f"Error checking WebSocket health: {e}")
+
     
     async def log_market_status_with_analysis(self):
-        """Enhanced market status logging with price and signal analysis"""
+        """Enhanced market status logging with candle countdown"""
         try:
             current_time = datetime.now()
+        
+            # Log status every 30 seconds
+            if (current_time - self.last_price_update).total_seconds() >= 30:
             
-            # Log price every 30 seconds
-            if (current_time - self.last_price_update).total_seconds() >= self.price_log_interval:
-                
-                # Get current NIFTY price
-                nifty_price = None
+                # Get current NIFTY data
                 nifty_symbol = "NIFTY"
-                websocket_status = "Connected" if self.websocket_manager else "Disconnected"    
-                
+                websocket_status = "Connected" if self.websocket_manager else "Disconnected"
+            
+                # Get candle count
+                candle_count = 0
+                if self.websocket_manager and hasattr(self.websocket_manager, 'latest_ha_candles'):
+                    if nifty_symbol in self.websocket_manager.latest_ha_candles:
+                        candle_count = len(self.websocket_manager.latest_ha_candles[nifty_symbol])
+            
+                # Get current price
+                nifty_price = None
                 if nifty_symbol in self.latest_ticks:
                     nifty_price = self.latest_ticks[nifty_symbol].get('ltp', 0)
-                    data_age = (current_time - self.latest_ticks[nifty_symbol].get('timestamp', current_time)).total_seconds()
-                    
-                    if data_age > 120:  # Data older than 2 minutes
-                        websocket_status = "stale"
-                
-                # Log current status
-                if nifty_price:
-                    self.logger.info(f"Market Status - NIFTY: Rs.{nifty_price:.2f} | WebSocket: {websocket_status} | Strategies: Active")
+            
+                # Calculate time to next candle
+                if self.websocket_manager:
+                    current_candle = self.websocket_manager.candle_aggregator.get_current_candle(nifty_symbol)
+                    if current_candle:
+                        time_to_next = 60 - (current_time - current_candle['start_time']).total_seconds()
+                        next_candle_str = f" | Next candle in: {int(time_to_next)}s"
+                    else:
+                        next_candle_str = ""
                 else:
-                    self.logger.info(f"Market Status - NIFTY: No Data | WebSocket: {websocket_status} | Strategies: Active")
-                
+                    next_candle_str = ""
+            
+                # Log status with candle info
+                if candle_count < 15:
+                    status_msg = f"Market Status - NIFTY: Rs.{nifty_price:.2f} | Candles: {candle_count}/15{next_candle_str}"
+                else:
+                    status_msg = f"Market Status - NIFTY: Rs.{nifty_price:.2f} | Strategy: Active | Candles: {candle_count}{next_candle_str}"
+            
+                self.logger.info(status_msg)
                 self.last_price_update = current_time
             
-            # Detailed signal analysis every 3 minutes
-            if (current_time - self.last_signal_analysis_log).total_seconds() >= self.signal_analysis_interval:
-                await self.analyze_and_log_signal_conditions()
-                self.last_signal_analysis_log = current_time
-                
         except Exception as e:
             self.logger.error(f"Error logging market status: {e}")
     
@@ -349,11 +541,11 @@ class TradingBot:
                 
                 # Detailed analysis log
                 self.logger.info(f"Pine Script Analysis:")
-                self.logger.info(f"   💰 Current Price: Rs.{current_price:.2f}")
-                self.logger.info(f"   📈 Trend Line: Rs.{trend_line:.2f} ({price_diff:+.2f} | {price_diff_pct:+.2f}%)")
-                self.logger.info(f"   🕯️ Candle: {'🟢 Strong Green' if strong_green else '🟡 Weak'} ({body_pct:.1%})")
-                self.logger.info(f"   📊 ADX: {adx:.1f} ({'✅' if trend_ok else '❌'} > {strategy.adx_threshold})")
-                self.logger.info(f"   🎯 Position: {'📍 In Trade' if strategy.in_trade else '🆓 Available'}")
+                self.logger.info(f"    Current Price: Rs.{current_price:.2f}")
+                self.logger.info(f"    Trend Line: Rs.{trend_line:.2f} ({price_diff:+.2f} | {price_diff_pct:+.2f}%)")
+                self.logger.info(f"    Candle: {' Strong Green' if strong_green else ' Weak'} ({body_pct:.1%})")
+                self.logger.info(f"    ADX: {adx:.1f} ({'' if trend_ok else ''} > {strategy.adx_threshold})")
+                self.logger.info(f"    Position: {' In Trade' if strategy.in_trade else ' Available'}")
                 
                 # Determine signal status
                 buy_conditions = [
@@ -424,7 +616,7 @@ class TradingBot:
                 elif pine_strategy:
                     signal_status = f"🔄 Building Data ({len(pine_strategy.ha_candles_history)}/15)"
             
-            message = f"""📊 *Hourly Status Update*
+            message = f""" *Hourly Status Update*
 
 🕐 *Session Time:* {hours}h {minutes}m
 📈 *NIFTY:* {nifty_price}{nifty_change}
@@ -909,4 +1101,523 @@ Thanks for testing! See you tomorrow! 👋"""
             except Exception as e:
                 await strategy.on_error(e)
                 await self.notifier.send_error_alert(f"Strategy {strategy.name} error: {str(e)}")
+                
+                
+# ==================== Enhanced Multi-Strategy Trading Bot ====================
+
+# Add these enhancements to your existing trading_bot.py:
+
+class MultiStrategyTradingBot(TradingBot):  # Extend your existing TradingBot
+    """Enhanced trading bot supporting multiple strategies simultaneously"""
+    
+    def __init__(self, settings: Settings):
+        super().__init__(settings)
+        
+        # Multi-strategy containers
+        self.strategy_configs = {}
+        self.strategy_performance = {}
+        
+    def add_strategy_config(self, strategy_name: str, config: Dict):
+        """Add strategy configuration"""
+        self.strategy_configs[strategy_name] = config
+        self.strategy_performance[strategy_name] = {
+            'trades': 0,
+            'wins': 0,
+            'total_pnl': 0.0,
+            'best_trade': 0.0,
+            'worst_trade': 0.0
+        }
+        self.logger.info(f"Added strategy config: {strategy_name} - {config['trading_mode']}")
+    
+    def initialize_strategies(self):
+        """Initialize all configured strategies"""
+        
+        # Clear existing strategies
+        self.strategies = []
+        
+        for strategy_name, config in self.strategy_configs.items():
+            try:
+                # Import enhanced strategy
+                from src.strategy.enhanced_pine_script_strategy import EnhancedPineScriptStrategy
+                
+                # Create strategy instance
+                strategy = EnhancedPineScriptStrategy(strategy_name, config)
+                self.add_strategy(strategy)
+                
+                self.logger.info(f"✅ Initialized strategy: {strategy_name} ({config['trading_mode']})")
+                
+            except Exception as e:
+                self.logger.error(f"❌ Failed to initialize strategy {strategy_name}: {e}")
+    
+    async def evaluate_strategies_on_new_candle(self, symbol: str, ha_candle: Dict):
+        """Enhanced strategy evaluation for multiple strategies"""
+        try:
+            if not self.is_market_open():
+                return
+            
+            # Prepare market data
+            market_data = self.prepare_market_data_for_strategy(symbol, ha_candle)
+            
+            # Process each strategy
+            for strategy in self.strategies:
+                if not strategy.is_active:
+                    continue
+                
+                try:
+                    # Check for entry signals
+                    entry_order = await strategy.should_enter(market_data)
+                    if entry_order:
+                        if await self.place_enhanced_order(entry_order):
+                            self.orders.append(entry_order)
+                            await strategy.on_order_filled(entry_order)
+                            
+                            # Send strategy-specific notification
+                            await self.send_multi_strategy_notification(entry_order, "ENTRY")
+                    
+                    # Check for exit signals on existing positions
+                    for position_key, position in list(self.positions.items()):
+                        # Only check positions belonging to this strategy
+                        if getattr(position, 'strategy_name', '') == strategy.name:
+                            exit_order = await strategy.should_exit(position, market_data)
+                            if exit_order:
+                                if await self.place_enhanced_order(exit_order):
+                                    self.orders.append(exit_order)
+                                    await strategy.on_order_filled(exit_order)
+                                    
+                                    # Update performance tracking
+                                    await self.update_strategy_performance(exit_order, position)
+                                    
+                                    # Send exit notification
+                                    await self.send_multi_strategy_notification(exit_order, "EXIT")
+                                    
+                                    # Remove closed position
+                                    if exit_order.quantity >= position.quantity:
+                                        del self.positions[position_key]
+                
+                except Exception as e:
+                    self.logger.error(f"Error processing strategy {strategy.name}: {e}")
+                    
+        except Exception as e:
+            self.logger.error(f"Error evaluating strategies: {e}")
+    
+    async def place_enhanced_order(self, order: Order) -> bool:
+        """Enhanced order placement with multi-strategy support"""
+        try:
+            if self.paper_trading:
+                # Enhanced paper trading with strategy tracking
+                order.status = OrderStatus.FILLED
+                order.filled_price = order.price
+                order.filled_quantity = order.quantity
+                order.order_id = f"PAPER_{order.strategy_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                
+                # Calculate investment details
+                lot_size = 75
+                total_investment = order.quantity * lot_size * order.price
+                total_shares = order.quantity * lot_size
+                
+                self.trading_logger.info(
+                    f"📋 PAPER TRADE [{order.strategy_name}] - {order.transaction_type.value} {order.quantity} lots "
+                    f"({total_shares:,} shares) of {order.symbol} @ Rs.{order.price:.2f}"
+                )
+                self.trading_logger.info(f"💰 Total Investment: Rs.{total_investment:,.2f}")
+                
+                # Update paper positions with strategy info
+                await self.update_enhanced_paper_positions(order)
+                
+                return True
+            else:
+                # Real order placement logic would go here
+                # ... existing real trading code ...
+                pass
+                
+        except Exception as e:
+            self.logger.error(f"Error placing enhanced order: {e}")
+            return False
+    
+    async def update_enhanced_paper_positions(self, order: Order):
+        """Update paper positions with multi-strategy tracking"""
+        try:
+            position_key = f"{order.symbol}_{order.strategy_name}_{getattr(order, 'option_type', 'CE')}"
+            
+            if order.transaction_type == TransactionType.BUY:
+                entry_time = datetime.now()
+                
+                if position_key in self.positions:
+                    existing = self.positions[position_key]
+                    total_quantity = existing.quantity + order.quantity
+                    total_cost = (existing.quantity * existing.average_price) + (order.quantity * order.price)
+                    new_avg_price = total_cost / total_quantity
+                    
+                    existing.quantity = total_quantity
+                    existing.average_price = new_avg_price
+                else:
+                    position = Position(
+                        symbol=order.symbol,
+                        quantity=order.quantity,
+                        average_price=order.price,
+                        current_price=order.price,
+                        pnl=0,
+                        unrealized_pnl=0,
+                        instrument_key=order.instrument_key or 'default'
+                    )
+                    # Add strategy-specific attributes
+                    position.entry_time = entry_time
+                    position.strategy_name = order.strategy_name
+                    position.option_type = getattr(order, 'option_type', 'CE')
+                    position.strategy_mode = getattr(order, 'strategy_mode', 'CE')
+                    
+                    self.positions[position_key] = position
+            
+            elif order.transaction_type == TransactionType.SELL:
+                if position_key in self.positions:
+                    existing = self.positions[position_key]
+                    entry_time = getattr(existing, 'entry_time', datetime.now())
+                    exit_time = datetime.now()
+                    
+                    if order.quantity >= existing.quantity:
+                        # Close position completely
+                        lot_size = 75
+                        pnl = (order.price - existing.average_price) * existing.quantity * lot_size
+                        
+                        # Update global statistics
+                        self.total_pnl += pnl
+                        self.total_trades += 1
+                        
+                        if pnl > 0:
+                            self.winning_trades += 1
+                        
+                        if pnl > self.best_trade:
+                            self.best_trade = pnl
+                        if pnl < self.worst_trade:
+                            self.worst_trade = pnl
+                        
+                        # Update strategy-specific performance
+                        strategy_name = order.strategy_name
+                        if strategy_name in self.strategy_performance:
+                            perf = self.strategy_performance[strategy_name]
+                            perf['trades'] += 1
+                            perf['total_pnl'] += pnl
+                            if pnl > 0:
+                                perf['wins'] += 1
+                            if pnl > perf['best_trade']:
+                                perf['best_trade'] = pnl
+                            if pnl < perf['worst_trade']:
+                                perf['worst_trade'] = pnl
+                        
+                        # Send P&L notification
+                        await self.send_enhanced_pnl_notification(order.symbol, pnl, existing.average_price, 
+                                                       order.price, existing.quantity, entry_time, exit_time, order.strategy_name)
+                        
+                        del self.positions[position_key]
+                        self.trading_logger.info(f"Position closed [{order.strategy_name}]: {order.symbol} P&L: Rs.{pnl:.2f}")
+                    else:
+                        # Partial close
+                        existing.quantity -= order.quantity
+                        
+        except Exception as e:
+            self.logger.error(f"Error updating enhanced paper positions: {e}")
+    
+    async def send_multi_strategy_notification(self, order: Order, action: str):
+        """Send strategy-specific notifications"""
+        try:
+            strategy_name = getattr(order, 'strategy_name', 'Unknown')
+            option_type = getattr(order, 'option_type', 'CE')
+            strategy_mode = getattr(order, 'strategy_mode', 'CE')
+            
+            # Strategy-specific emojis and colors
+            strategy_info = {
+                'CE': {'emoji': '^', 'name': 'Bullish CE', 'color': '🟢'},
+                'PE': {'emoji': '>', 'name': 'Bearish PE', 'color': '🔴'},
+                'BIDIRECTIONAL': {'emoji': '', 'name': 'Bidirectional', 'color': '🔵'}
+            }
+            
+            info = strategy_info.get(strategy_mode, strategy_info['CE'])
+            
+            if action == "ENTRY":
+                lot_size = 75
+                total_shares = order.quantity * lot_size
+                total_investment = order.quantity * lot_size * order.price
+                current_capital = 20000 + self.total_pnl
+                
+                message = f"""{info['emoji']} {info['name']} SIGNAL - AstraRise Bot
+
+📊 *Strategy:* {strategy_name}
+🎯 *Mode:* {strategy_mode} | *Option:* {option_type}
+💰 *Analysis:* Pine Script {info['name']} Signal Detected!
+
+💰 *PAPER TRADE EXECUTED:*
+🔹 *Symbol:* {order.symbol}
+🔹 *Action:* BUY {order.quantity} lots ({total_shares:,} shares)
+🔹 *Price:* Rs.{order.price:.2f} per share
+🔹 *Investment:* Rs.{total_investment:,.2f}
+
+📈 *Capital Management:*
+💵 *Total Capital:* Rs.{current_capital:,.2f}
+💸 *Used:* Rs.{total_investment:,.2f} ({(total_investment/current_capital)*100:.1f}%)
+💰 *Remaining:* Rs.{current_capital - total_investment:,.2f}
+
+⏰ *Time:* {datetime.now().strftime('%I:%M:%S %p')}
+
+🎯 {strategy_name} strategy executing! 🚀"""
+                
+                await self.notifier.send_message(message)
+                
+        except Exception as e:
+            self.logger.error(f"Error sending multi-strategy notification: {e}")
+    
+    async def send_enhanced_pnl_notification(self, symbol: str, pnl: float, entry_price: float, 
+                                           exit_price: float, quantity: int, entry_time: datetime, 
+                                           exit_time: datetime, strategy_name: str):
+        """Send enhanced P&L notification with strategy performance"""
+        try:
+            lot_size = 75
+            total_shares = quantity * lot_size
+            trade_value = entry_price * total_shares
+            pnl_pct = (pnl / trade_value) * 100 if trade_value > 0 else 0
+            
+            # Calculate trade duration
+            duration = exit_time - entry_time
+            duration_minutes = int(duration.total_seconds() / 60)
+            duration_hours = duration_minutes // 60
+            duration_mins = duration_minutes % 60
+            
+            # Determine status
+            status_emoji = "🟢" if pnl > 0 else "🔴"
+            status_text = "PROFIT" if pnl > 0 else "LOSS"
+            
+            # Get strategy performance
+            strategy_perf = self.strategy_performance.get(strategy_name, {})
+            strategy_trades = strategy_perf.get('trades', 0)
+            strategy_wins = strategy_perf.get('wins', 0)
+            strategy_win_rate = (strategy_wins / max(1, strategy_trades)) * 100
+            strategy_pnl = strategy_perf.get('total_pnl', 0.0)
+            
+            # Calculate overall win rate
+            overall_win_rate = (self.winning_trades / max(1, self.total_trades)) * 100
+            
+            message = f"""📊 *TRADE COMPLETED - {strategy_name}*
+
+{status_emoji} *{status_text}:* Rs.{abs(pnl):,.2f} ({pnl_pct:+.2f}%)
+
+📈 *Trade Details:*
+🔹 *Strategy:* {strategy_name}
+🔹 *Symbol:* {symbol}
+🔹 *Quantity:* {quantity} lots ({total_shares:,} shares)
+🔹 *Entry Price:* Rs.{entry_price:.2f}
+🔹 *Exit Price:* Rs.{exit_price:.2f}
+🔹 *Price Change:* Rs.{exit_price - entry_price:+.2f}
+
+⏰ *Timing:*
+📅 *Entry:* {entry_time.strftime('%I:%M:%S %p')}
+📅 *Exit:* {exit_time.strftime('%I:%M:%S %p')}
+⏱️ *Duration:* {duration_hours}h {duration_mins}m
+
+📊 *Strategy Performance ({strategy_name}):*
+🎯 *Trades:* {strategy_trades}
+✅ *Wins:* {strategy_wins} ({strategy_win_rate:.1f}%)
+💵 *Strategy P&L:* Rs.{strategy_pnl:,.2f}
+
+📊 *Overall Session Performance:*
+🎯 *Total Trades:* {self.total_trades}
+✅ *Winning Trades:* {self.winning_trades} ({overall_win_rate:.1f}%)
+💵 *Total P&L:* Rs.{self.total_pnl:,.2f}
+📈 *Pine Script Target:* 67% (Current: {overall_win_rate:.1f}%)
+
+🏆 *Records:*
+🥇 *Best Trade:* Rs.{self.best_trade:,.2f}
+📉 *Worst Trade:* Rs.{self.worst_trade:,.2f}
+
+{"🎉 Excellent work!" if pnl > 0 else "💪 Stay strong, next one will be better!"}"""
+            
+            await self.notifier.send_message(message)
+            
+        except Exception as e:
+            self.logger.error(f"Error sending enhanced P&L notification: {e}")
+    
+    async def send_multi_strategy_status_update(self):
+        """Send comprehensive multi-strategy status update"""
+        try:
+            current_time = datetime.now()
+            
+            # Calculate session stats
+            session_duration = current_time - self.session_start_time
+            hours = int(session_duration.total_seconds() / 3600)
+            minutes = int((session_duration.total_seconds() % 3600) / 60)
+            
+            # Get current NIFTY price
+            nifty_price = "N/A"
+            nifty_change = ""
+            if "NIFTY" in self.latest_ticks:
+                price = self.latest_ticks['NIFTY'].get('ltp', 0)
+                nifty_price = f"Rs.{price:.2f}"
+                
+                if hasattr(self, 'session_start_price'):
+                    change = price - self.session_start_price
+                    change_pct = (change / self.session_start_price) * 100
+                    nifty_change = f" ({change:+.2f} | {change_pct:+.2f}%)"
+            
+            # WebSocket status
+            ws_status = "✅ Connected"
+            if not self.websocket_manager:
+                ws_status = "❌ Disconnected"
+            elif self.websocket_reconnect_attempts > 0:
+                ws_status += f" (Reconnected {self.websocket_reconnect_attempts}x)"
+            
+            # Strategy performance summary
+            strategy_summary = ""
+            for strategy_name, perf in self.strategy_performance.items():
+                trades = perf['trades']
+                wins = perf['wins']
+                win_rate = (wins / max(1, trades)) * 100
+                pnl = perf['total_pnl']
+                
+                config = self.strategy_configs.get(strategy_name, {})
+                mode = config.get('trading_mode', 'Unknown')
+                
+                strategy_summary += f"""
+🎯 *{strategy_name}* ({mode}):
+   📊 Trades: {trades} | Win Rate: {win_rate:.1f}%
+   💵 P&L: Rs.{pnl:,.2f}"""
+            
+            message = f"""📊 *Multi-Strategy Status Update*
+
+🕐 *Session Time:* {hours}h {minutes}m
+📈 *NIFTY:* {nifty_price}{nifty_change}
+🔗 *WebSocket:* {ws_status}
+
+📊 *Overall Performance:*
+🎯 *Total Trades:* {self.total_trades}
+💵 *Total P&L:* Rs.{self.total_pnl:,.2f}
+✅ *Overall Win Rate:* {(self.winning_trades/max(1,self.total_trades))*100:.1f}%
+🏆 *Best Trade:* Rs.{self.best_trade:,.2f}
+{strategy_summary}
+
+🎯 *Pine Script Multi-Strategy Status:*
+📊 *Target Accuracy:* 67%
+🔍 *Active Strategies:* {len(self.strategies)}
+⚡ *Mode:* Paper Trading (Safe testing)
+
+💪 *All strategies monitoring and ready!*"""
+            
+            await self.notifier.send_message(message)
+            
+        except Exception as e:
+            self.logger.error(f"Error sending multi-strategy status update: {e}")
+
+# ==================== Strategy Configuration Helper ====================
+
+class StrategyConfigManager:
+    """Helper class to manage strategy configurations"""
+    
+    @staticmethod
+    def get_ce_only_config(capital_allocation: float = 0.33):
+        """Configuration for CE-only strategy"""
+        return {
+            'strategy_id': 'CE_Pine_Script',
+            'trading_mode': 'CE_ONLY',
+            'adx_length': 14,
+            'adx_threshold': 20,
+            'strong_candle_threshold': 0.6,
+            'max_positions': 1,
+            'total_capital': int(20000 * capital_allocation),
+            'max_risk_pct': 0.75,
+            'risk_per_trade': int(15000 * capital_allocation)
+        }
+    
+    @staticmethod
+    def get_pe_only_config(capital_allocation: float = 0.33):
+        """Configuration for PE-only strategy"""
+        return {
+            'strategy_id': 'PE_Pine_Script',
+            'trading_mode': 'PE_ONLY',
+            'adx_length': 14,
+            'adx_threshold': 20,
+            'strong_candle_threshold': 0.6,
+            'max_positions': 1,
+            'total_capital': int(20000 * capital_allocation),
+            'max_risk_pct': 0.75,
+            'risk_per_trade': int(15000 * capital_allocation)
+        }
+    
+    @staticmethod
+    def get_bidirectional_config(capital_allocation: float = 0.34):
+        """Configuration for bidirectional strategy"""
+        return {
+            'strategy_id': 'Bidirectional_Pine_Script',
+            'trading_mode': 'BIDIRECTIONAL',
+            'adx_length': 14,
+            'adx_threshold': 20,
+            'strong_candle_threshold': 0.6,
+            'max_positions': 2,  # Can hold both CE and PE
+            'total_capital': int(20000 * capital_allocation),
+            'max_risk_pct': 0.75,
+            'risk_per_trade': int(15000 * capital_allocation)
+        }
+    
+    @staticmethod
+    def get_all_strategies_config():
+        """Get configuration for all three strategies"""
+        return {
+            'CE_Pine_Script': StrategyConfigManager.get_ce_only_config(),
+            'PE_Pine_Script': StrategyConfigManager.get_pe_only_config(),
+            'Bidirectional_Pine_Script': StrategyConfigManager.get_bidirectional_config()
+        }
+
+# ==================== Enhanced Main Runner ====================
+
+async def run_multi_strategy_bot():
+    """Enhanced main function for multi-strategy bot"""
+    
+    # Load settings
+    settings = Settings()
+    
+    # Create multi-strategy bot
+    bot = MultiStrategyTradingBot(settings)
+    
+    # Configure strategies based on environment variable or default
+    import os
+    strategy_mode = os.getenv('STRATEGY_MODE', 'ALL')  # CE_ONLY, PE_ONLY, BIDIRECTIONAL, ALL
+    
+    config_manager = StrategyConfigManager()
+    
+    if strategy_mode == 'CE_ONLY':
+        bot.add_strategy_config('CE_Pine_Script', config_manager.get_ce_only_config(1.0))
+        
+    elif strategy_mode == 'PE_ONLY':
+        bot.add_strategy_config('PE_Pine_Script', config_manager.get_pe_only_config(1.0))
+        
+    elif strategy_mode == 'BIDIRECTIONAL':
+        bot.add_strategy_config('Bidirectional_Pine_Script', config_manager.get_bidirectional_config(1.0))
+        
+    else:  # ALL strategies
+        strategies_config = config_manager.get_all_strategies_config()
+        for name, config in strategies_config.items():
+            bot.add_strategy_config(name, config)
+    
+    # Initialize all configured strategies
+    bot.initialize_strategies()
+    
+    # Override the periodic update method
+    bot.send_periodic_telegram_update = bot.send_multi_strategy_status_update
+    
+    # Run the bot
+    await bot.run()
+
+# ==================== Usage Instructions ====================
+
+# To run different strategy modes:
+
+# 1. CE Only:
+# STRATEGY_MODE=CE_ONLY python main_multi_strategy.py
+
+# 2. PE Only:
+# STRATEGY_MODE=PE_ONLY python main_multi_strategy.py
+
+# 3. Bidirectional:
+# STRATEGY_MODE=BIDIRECTIONAL python main_multi_strategy.py
+
+# 4. All strategies:
+# STRATEGY_MODE=ALL python main_multi_strategy.py
+# or simply:
+# python main_multi_strategy.py
                 
